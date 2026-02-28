@@ -119,19 +119,17 @@ DIF‑PI is structured as a **predict → simulate → forecast → optimize →
 Let $\mathcal{T}(s,t)$ be the set of transactions for SKU $s$ on day $t$, with quantity $q_i$ and unit price $p_i$:
 
 - **Demand (units):**
-$$
+```math
 Q_{s,t} = \sum_{i\in \mathcal{T}(s,t)} q_i
-$$
-
+```
 - **Price (quantity-weighted unit price):**
-$$
+```math
 P_{s,t} =
 \begin{cases}
 \frac{\sum_{i\in \mathcal{T}(s,t)} p_i q_i}{\sum_{i\in \mathcal{T}(s,t)} q_i}, & \sum q_i > 0 \\
 \frac{1}{|\mathcal{T}(s,t)|}\sum_{i\in \mathcal{T}(s,t)} p_i, & \text{otherwise}
 \end{cases}
-$$
-
+```
 **Continuity assumptions used by the pipeline**
 - The panel is reindexed to **daily continuity** between the first and last observed day.
 - Missing demand is set to $0$ (no sales).
@@ -144,21 +142,20 @@ DIF‑PI uses Next Purchase Day **(NPD)** as a *timing or purchase-intention* si
 
 **Supervised formulation**  
 For each customer $c$ with purchase dates $(d_1, d_2, \dots, d_n)$, define inter-purchase gaps (in days):
-$$
+```math
 g_i = d_{i+1} - d_i,\quad i=1,\dots,n-1
-$$
-
+```
 Given a history length $k$, NPD builds supervised samples:
-$$
+```math
 \mathbf{x}_i = [g_{i-k}, \dots, g_{i-1}],\qquad y_i = g_i
-$$
+```
 Any regressor can be used, as the module is model-agnostic: fit $\hat g = f(\mathbf{x})$.
 
 **Purchase intention index (next $H$ days)**  
 For each customer, predict the next gap $\hat g_c$ and map it to a predicted purchase day:
-$$
+```math
 \hat d_c = d_{\max} + \mathrm{round}(\hat g_c)
-$$
+```
 Count predicted purchases per future day and normalize to $[0,1]$ to obtain an intention index over the horizon.
 
 **Reliability gate (MAE $\rightarrow$ timing weight)**  
@@ -176,52 +173,48 @@ Operationally, $\alpha$ controls how strongly NPD can justify window timing deci
 
 #### 3.1 Elasticity model
 TBWISA uses a log-log demand model:
-$$
+```math
 \log Q_t = \beta_0 + \varepsilon \log P_t + u_t
-$$
+```
 where $\varepsilon$ is the price elasticity and $u_t$ are residuals (kept for reconstruction).
 
 #### 3.2 Controlled elasticity
 When enabled (`configure_controlled_elasticity`), TBWISA fits a robust regression with controls:
-$$
+```math
 \log Q_t = \beta_0 + \varepsilon \log P_t + \gamma^\top \mathbf{z}_t + e_t
-$$
+```
 Typical controls $\mathbf{z}_t$ include:
 - trend (z-scored time index),
 - Fourier seasonality terms (e.g., weekly / yearly),
 - lagged log-demand $\log Q_{t-1}$.
 
 To reduce identifiability issues, the fit can be restricted to **price-change events**:
-$$
+```math
 |\log P_t - \log P_{t-1}| \ge \log(1+\tau)
-$$
+```
 where $\tau$ is a price-change threshold. A non-positive prior is enforced ($\varepsilon \le -\epsilon_\text{prior}$), and an optional magnitude cap can be applied.
 
 #### 3.3 Counterfactual under a price intervention
 For an intervention $\delta$ (%), define:
-$$
+```math
 P_t^{(\delta)} = P_t\left(1+\frac{\delta}{100}\right)
-$$
-
+```
 TBWISA reconstructs counterfactual demand by reusing the fitted residuals:
-$$
+```math
 \hat Q_t^{(\delta)} =
 \exp\left(\beta_0 + \varepsilon_\delta \log P_t^{(\delta)} + u_t\right)
-$$
-
+```
 Non-linear elasticity shaping adjusts:
-$$
+```math
 \varepsilon_\delta = \varepsilon\left(1 + 0.5\left(\frac{\delta}{100}\right)^2\right)
-$$
-
+```
 #### 3.4 Controlled stochasticity
 To avoid brittle single-trajectory decisions, TBWISA applies a capped multiplicative shock:
-$$
+```math
 Q_{t,\text{stoch}}^{(\delta)} = \hat Q_t^{(\delta)}\left(1 + \eta_t\right),
 \quad
 \eta_t \sim \mathcal{N}\!\left(0,\,\sigma|\delta|\right),\ \eta_t \in [-c,c]
-$$
-
+```
 ---
 
 ### 4) Global Transformer forecaster
@@ -229,54 +222,49 @@ $$
 
 **Windowed training objective**  
 Let $y_t$ be demand. With sequence length $L$, form windows:
-$$
+```math
 \mathbf{x}_t = [y_{t-L},\dots,y_{t-1}],\qquad y_t\ \text{target}
-$$
+```
 The model learns $f_\theta(\mathbf{x}_t)\approx y_t$ by minimizing a robust loss (using Huber).
 
 **Multi-step forecasting**  
 Given the last $L$ observations, DIF‑PI rolls forward autoregressively:
-$$
+```math
 \hat y_{t+1}=f_\theta([y_{t-L+1},\dots,y_t]),\quad
 \hat y_{t+h}=f_\theta([\hat y_{t+h-L},\dots,\hat y_{t+h-1}])
-$$
-
+```
 Scaling is applied per SKU at inference time to avoid leakage.
 
 ---
 
 ### 5) Optimal profit window search
 For each intervention $\delta$, DIF‑PI computes forecast revenue:
-$$
+```math
 R_t^{(\delta)} = P_t^{(\delta)} \cdot \hat Q_t^{(\delta)}
-$$
-
+```
 For a candidate window starting at offset $s$ with length $\ell$ (within $\ell\in[\ell_{\min},\ell_{\max}]$), the average revenue is:
-$$
+```math
 \bar R_{s,\ell}^{(\delta)}=\frac{1}{\ell}\sum_{t=s}^{s+\ell-1} R_t^{(\delta)}
-$$
-
+```
 The window score follows the implementation:
-$$
+```math
 \text{score}(s,\ell)=\bar R_{s,\ell}^{(\delta)} - \lambda \ell
-$$
+```
 where $\lambda$ is an optional length penalty. The selected window is:
-$$
+```math
 (s^{*},\ell^{*})=\arg\max_{s,\ell}\ \text{score}(s,\ell)
-$$
-
+```
 ---
 
 ### 6) X‑TBWISA screening
 Screening is a behavioral consistency check applied before executive export:
 
 1) **Surrogate fidelity:** fit a surrogate $\hat f$ to approximate the teacher (Transformer) response over the intervention grid and report:
-$$
+```math
 \mathrm{MAE}=\frac{1}{N}\sum_{i=1}^{N}\left|\hat y^{(\text{teacher})}_i-\hat y^{(\text{surrogate})}_i\right|,
 \quad
 \mathrm{RMSE}=\sqrt{\frac{1}{N}\sum_{i=1}^{N}\left(\hat y^{(\text{teacher})}_i-\hat y^{(\text{surrogate})}_i\right)^2}
-$$
-
+```
 2) **SHAP diagnostics:** compute SHAP values on the surrogate to detect explanation drift across $\delta$ (tagged as `high_shap_drift` when unstable).
 
 3) **Economic plausibility checks:** enforce basic intervention coherence (implausible response patterns across $\delta$ are tagged as `economic_plausibility_fail`).
