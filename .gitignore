@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# MACOS specific
+.DS_Store
+
+# Project data/artifacts: ignore contents but keep empty dirs in git
+/datasets/*
+!/datasets/.gitkeep
+/artifacts/*
+!/artifacts/.gitkeep
