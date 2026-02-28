@@ -1,11 +1,5 @@
 # DIF‑PI — Decision Intelligence Framework for Predicting Purchase Intentions in e‑Commerce
 
-This repository contains the research code, notebooks, and artifacts accompanying the PhD thesis:
-
-> **Decision Intelligence Framework for Predicting Purchase Intentions in e‑commerce**  
-> *PhD student:* Alexandru Grigoraș · *Scientific coordinator:* Prof. Dr. Eng. Florin Leon  
-> “Gheorghe Asachi” Technical University of Iași — Faculty of Automatic Control and Computer Engineering
-
 DIF‑PI operationalizes a **decision intelligence pipeline** that moves from *prediction* (**when** a purchase is likely) to *prescription* (**what** pricing action to take, **when**, and with what risk flags) with the following modules:
 
 - **Purchase intention / timing** (*NPD*) — *when* customers are likely to purchase next
@@ -466,29 +460,14 @@ Then run `eda-complete-journey.ipynb` to generate the DIF‑PI inputs in `datase
 - `train-forecaster.ipynb` writes train/test SKU lists next to the saved model.
 - DIF‑PI includes decision guardrails to downgrade risky actions (e.g., extreme elasticity / uplift).
 
+## Resources
 
-## Citation
-
-### Thesis
-```bibtex
-@phdthesis{grigoras_difpi_thesis_2026,
-  title  = {Decision Intelligence Framework for Predicting Purchase Intentions in e-commerce},
-  author = {Grigoras, Alexandru},
-  school = {''Gheorghe Asachi'' Technical University of Iasi},
-  year   = {2026},
-  note   = {Code and notebooks available in this repository.}
-}
-```
-
-
-# Publications
-
-The thesis integrates and extends four research components:
+The framework integrates and extends four research components:
 
 1) [**Synthetic Time Series Generation for Decision Intelligence Using Large Language Models**](https://www.mdpi.com/2227-7390/12/16/2494) (SDG module)  
 2) [**Transformer‑Based Model for Predicting Customers’ Next Purchase Day in e‑Commerce**](https://www.mdpi.com/2079-3197/11/11/210) (NPD module)  
 3) [**Generating and Optimizing What‑If Scenarios Using a Transformers‑Based Forecasting Model**](https://ieeexplore.ieee.org/document/11240464) (TBWISA module)  
-4) **X‑TBWISA: Explainable What‑If Scenario Generation Using Transformers and SHAP Guidance** (explainability / screening layer)
+4) **X‑TBWISA: Explainable What‑If Scenario Generation Using Transformers and SHAP Guidance** (Explainability layer)
 
 
 ## License
