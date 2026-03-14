@@ -77,27 +77,44 @@ class NPDModel:
     ):
         """Compute a simple purchase intention index over the next `horizon` days.
 
-        For each customer with enough history, predict their next inter-purchase gap (days), map it to a date,
-        and count how many customers are predicted to purchase on each day.
-        Returns:
-            t0: last observed date in tx (normalized to day)
-            idx: pd.Series indexed by dates, normalized to [0,1]
+        For each customer with enough history, predict the next inter-purchase gap (days),
+        map it to a date, and count how many customers are predicted to purchase on each day.
+
+        This version supports both:
+        - classic one-step regressors returning shape (n_samples,)
+        - direct multi-step forecasters returning shape (n_samples, H)
+
+        For multi-step models, the first predicted step is used as the next-gap estimate.
         """
         k = self.k if k is None else int(k)
         horizon = self.horizon if horizon is None else int(horizon)
 
+        # If the loaded model exposes its required input length, prefer that.
+        model_k = int(getattr(model, "input_length", k))
+
         t = tx[[cust_col, date_col]].dropna().sort_values([cust_col, date_col])
         t0 = t[date_col].max().normalize()
-        days = pd.date_range(t0 + pd.Timedelta(days=1), t0 + pd.Timedelta(days=horizon), freq='D')
+        days = pd.date_range(t0 + pd.Timedelta(days=1), t0 + pd.Timedelta(days=horizon), freq="D")
         counts = pd.Series(0.0, index=days)
 
         for _, g in t.groupby(cust_col):
             d = g[date_col].values
-            if len(d) < k + 1:
+            if len(d) < model_k + 1:
                 continue
-            gaps = np.diff(d).astype('timedelta64[D]').astype(int)
-            x = gaps[-k:].reshape(1, -1)
-            gap_pred = float(np.clip(model.predict(x)[0], 1.0, horizon))
+
+            gaps = np.diff(d).astype("timedelta64[D]").astype(int)
+            if len(gaps) < model_k:
+                continue
+
+            x = gaps[-model_k:].reshape(1, -1)
+
+            pred = np.asarray(model.predict(x), dtype=float).reshape(-1)
+            if pred.size == 0:
+                continue
+
+            # For direct multi-step models, use the first step as the next-gap estimate
+            gap_pred = float(np.clip(pred[0], 1.0, horizon))
+
             pred_date = (t0 + pd.Timedelta(days=int(round(gap_pred)))).normalize()
             if pred_date in counts.index:
                 counts.loc[pred_date] += 1.0
