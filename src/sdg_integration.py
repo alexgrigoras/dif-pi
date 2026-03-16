@@ -1,17 +1,16 @@
-from __future__ import annotations
+"""SDG integration helpers for DIF-PI."""
 
+from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+from src.sdg import LLMSyntheticTimeSeriesGenerator
 import gc
 import json
 import numpy as np
 import pandas as pd
 
-from src.sdg import LLMSyntheticTimeSeriesGenerator
 
-
-# utilities
+# Utilities
 
 def contiguous_runs(mask: Sequence[bool]) -> List[Tuple[int, int]]:
     mask = np.asarray(mask, dtype=bool)
@@ -50,7 +49,7 @@ def _safe_empty_cache() -> None:
         pass
 
 
-# data preparation
+# Data preparation
 
 def build_daily_panel_for_sdg(
     panel_df: pd.DataFrame,
@@ -82,7 +81,6 @@ def build_daily_panel_for_sdg(
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=[sku_col, time_col, demand_col])
 
 
-
 def prepare_missingness_masks(
     sku_df_train: pd.DataFrame,
     *,
@@ -111,7 +109,7 @@ def prepare_missingness_masks(
     }
 
 
-# safe saved-model loading
+# Safe saved-model loading
 
 def _build_sdg_object_from_config(config: Dict[str, Any]) -> LLMSyntheticTimeSeriesGenerator:
     obj = LLMSyntheticTimeSeriesGenerator(
@@ -139,73 +137,26 @@ def _build_sdg_object_from_config(config: Dict[str, Any]) -> LLMSyntheticTimeSer
         add_calendar_features=bool(config.get("add_calendar_features", True)),
         warmup_ratio=float(config.get("warmup_ratio", 0.05)),
         weight_decay=float(config.get("weight_decay", 0.01)),
+        privacy_reference_max_windows=int(config.get("privacy_reference_max_windows", 2000)),
+        privacy_min_distance_quantile=float(config.get("privacy_min_distance_quantile", 0.10)),
+        privacy_distance_penalty=float(config.get("privacy_distance_penalty", 2.0)),
+        privacy_noise_strength=float(config.get("privacy_noise_strength", 0.06)),
+        privacy_baseline_blend=float(config.get("privacy_baseline_blend", 0.15)),
+        privacy_training_jitter_prob=float(config.get("privacy_training_jitter_prob", 0.35)),
+        privacy_training_jitter_strength=float(config.get("privacy_training_jitter_strength", 0.05)),
+        privacy_deduplicate_examples=bool(config.get("privacy_deduplicate_examples", True)),
+        privacy_filter_enabled=bool(config.get("privacy_filter_enabled", True)),
+        privacy_filter_max_retries=int(config.get("privacy_filter_max_retries", 3)),
     )
     obj.config.update(config)
     return obj
 
-
-
 def _safe_load_sdg_checkpoint(model_dir: Any) -> LLMSyntheticTimeSeriesGenerator:
     model_dir = Path(model_dir)
-    cfg = LLMSyntheticTimeSeriesGenerator._read_checkpoint_config(model_dir)
-    if not cfg:
-        raise FileNotFoundError(f"Missing or unreadable sdg_config.json in {model_dir}")
-
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-    from peft import PeftModel
-    import torch
-
-    _safe_empty_cache()
-
-    obj = _build_sdg_object_from_config(cfg)
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), use_fast=False, local_files_only=True)
-
-    base_model_id = str(cfg.get("base_model_id") or cfg.get("model_name") or obj.model_name)
-    base_model = AutoModelForSeq2SeqLM.from_pretrained(
-        base_model_id,
-        local_files_only=True,
-        dtype=torch.float32,
-    )
-
-    target_vocab = int(len(tokenizer))
-    current_vocab = int(base_model.get_input_embeddings().weight.shape[0])
-    if target_vocab != current_vocab:
-        base_model.resize_token_embeddings(target_vocab, mean_resizing=False)
-
-    adapter_config_path = model_dir / "adapter_config.json"
-    if adapter_config_path.exists():
-        model = PeftModel.from_pretrained(
-            base_model,
-            str(model_dir),
-            local_files_only=True,
-        )
-        obj.is_peft_model = True
-        obj.backend_name = str(cfg.get("backend_name", "loaded_saved_checkpoint"))
-    else:
-        # fallback for a fully merged model checkpoint saved in the same folder
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            str(model_dir),
-            local_files_only=True,
-            dtype=torch.float32,
-        )
-        obj.is_peft_model = bool(cfg.get("is_peft_model", False))
-        obj.backend_name = str(cfg.get("backend_name", "loaded_saved_checkpoint"))
-
-    model.eval()
-    obj.tokenizer = tokenizer
-    obj.model = model
-
-    training_info_path = model_dir / "training_info.json"
-    if training_info_path.exists():
-        try:
-            obj.training_info = json.loads(training_info_path.read_text(encoding="utf-8"))
-        except Exception:
-            obj.training_info = {}
-
-    return obj
+    return LLMSyntheticTimeSeriesGenerator.load(str(model_dir))
 
 
-# model acquisition
+# Model acquisition
 
 def load_or_train_sdg_model(
     *,
@@ -322,7 +273,7 @@ def load_or_train_sdg_model(
     return model, "trained_in_notebook"
 
 
-# gap fill
+# Gap fill
 
 def fill_missing_with_sdg(
     model: LLMSyntheticTimeSeriesGenerator,
@@ -330,9 +281,11 @@ def fill_missing_with_sdg(
     series: Sequence[float],
     fill_mask: Sequence[bool],
     dates: Sequence[Any],
-    num_return_sequences: int = 16,
-    temperature: float = 0.95,
-    top_p: float = 0.95,
+    num_return_sequences: int = 32,
+    temperature: float = 1.05,
+    top_p: float = 0.92,
+    top_k: int = 80,
+    repetition_penalty: float = 1.10,
     apply_seasonal_calibration: bool = False,
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     # build a no-NaN working series; only true missing points are overwritten later
@@ -387,7 +340,7 @@ def fill_missing_with_sdg(
 
             effective_num_return_sequences = base_num_return_sequences
             if run_len > max_chunk:
-                effective_num_return_sequences = min(base_num_return_sequences, 4)
+                effective_num_return_sequences = min(base_num_return_sequences, 6)
 
             gen = model.generate(
                 context_values=context,
@@ -396,12 +349,14 @@ def fill_missing_with_sdg(
                 do_sample=True,
                 temperature=float(temperature),
                 top_p=float(top_p),
+                top_k=int(top_k),
+                repetition_penalty=float(repetition_penalty),
                 context_dates=context_dates,
                 future_dates=future_dates,
                 apply_seasonal_calibration=bool(apply_seasonal_calibration),
             )
 
-            pred = np.asarray(gen.get("best_raw_future", gen.get("best_future")), dtype=float)[:chunk_len]
+            pred = np.asarray(gen.get("best_future", gen.get("best_raw_future")), dtype=float)[:chunk_len]
             pred = np.maximum(0.0, pred)
 
             local = local_level(filled, ctx_end, window=14)
@@ -433,7 +388,7 @@ def fill_missing_with_sdg(
     return result, pd.DataFrame(details)
 
 
-# top-level integration
+# Top-level integration
 
 def run_sdg_gapfill_for_case(
     *,
@@ -459,7 +414,7 @@ def run_sdg_gapfill_for_case(
     lora_rank: int = 16,
     lora_alpha: int = 32,
     seasonality_strength: float = 0.15,
-    num_return_sequences: int = 16,
+    num_return_sequences: int = 24,
     max_train_skus: int = 64,
     train_if_missing: bool = True,
     seed: int = 42,
@@ -467,8 +422,10 @@ def run_sdg_gapfill_for_case(
     include_metadata: bool = False,
     logging_steps: int = 25,
     save_steps: int = 250,
-    temperature: float = 0.95,
-    top_p: float = 0.95,
+    temperature: float = 1.02,
+    top_p: float = 0.92,
+    top_k: int = 80,
+    repetition_penalty: float = 1.10,
     apply_seasonal_calibration: bool = False,
 ) -> Dict[str, Any]:
     time_train = sku_df_train[time_col].values
@@ -520,6 +477,8 @@ def run_sdg_gapfill_for_case(
             num_return_sequences=num_return_sequences,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
             apply_seasonal_calibration=apply_seasonal_calibration,
         )
     else:

@@ -33,7 +33,7 @@ class _Decoder(nn.Module):
         return self.net(torch.cat([context_flat, z], dim=1))
 
 class DGANGenerator:
-    """Lightweight DGAN-style dynamic sequence generator baseline."""
+    """Lightweight DGAN dynamic sequence generator baseline."""
     def __init__(self, context_length: int, horizon: int, hidden_dim: int = 128, latent_dim: int = 16,
                  lr: float = 1e-3, batch_size: int = 64, epochs: int = 50, device: str | None = None, seed: int = 42):
         self.context_length = int(context_length)

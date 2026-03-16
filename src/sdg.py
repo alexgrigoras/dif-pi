@@ -1,3 +1,4 @@
+"""Synthetic demand generation utilities for DIF-PI."""
 
 import gc
 import inspect
@@ -10,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.neighbors import NearestNeighbors
 
 
 @dataclass
@@ -125,13 +127,6 @@ def _acf(values: Sequence[float], lag: int) -> float:
     return float(np.corrcoef(x1, x2)[0, 1])
 
 
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
-
-
 def compute_difpi_sku_split(
     panel_df: pd.DataFrame,
     sku_col: str = "StockCode",
@@ -242,7 +237,7 @@ def compute_difpi_sku_split(
 class LLMSyntheticTimeSeriesGenerator:
     def __init__(
         self,
-        model_name: str = "google-t5/t5-base",
+        model_name: str = "amazon/chronos-t5-small",
         context_length: int = 140,
         prediction_length: int = 30,
         num_bins: int = 4094,
@@ -257,15 +252,25 @@ class LLMSyntheticTimeSeriesGenerator:
         max_target_length: int = 256,
         random_state: int = 42,
         task_prefix: str = "generate synthetic retail demand future from historical context",
-        seasonality_strength: float = 0.70,
+        seasonality_strength: float = 0.60,
         seasonal_period: int = 7,
-        seasonal_fallback_strength: float = 0.35,
+        seasonal_fallback_strength: float = 0.25,
         zero_threshold_for_sparsity: float = 0.60,
-        prefer_backend: str = "qlora",
+        prefer_backend: str = "lora",
         use_special_tokens: bool = True,
         add_calendar_features: bool = True,
         warmup_ratio: float = 0.05,
         weight_decay: float = 0.01,
+        privacy_reference_max_windows: int = 2000,
+        privacy_min_distance_quantile: float = 0.25,
+        privacy_distance_penalty: float = 4.0,
+        privacy_noise_strength: float = 0.10,
+        privacy_baseline_blend: float = 0.25,
+        privacy_training_jitter_prob: float = 0.60,
+        privacy_training_jitter_strength: float = 0.10,
+        privacy_deduplicate_examples: bool = True,
+        privacy_filter_enabled: bool = True,
+        privacy_filter_max_retries: int = 6,
     ):
         self.model_name = str(model_name)
         self.context_length = int(context_length)
@@ -288,6 +293,16 @@ class LLMSyntheticTimeSeriesGenerator:
         self.add_calendar_features = bool(add_calendar_features)
         self.warmup_ratio = float(max(0.0, warmup_ratio))
         self.weight_decay = float(max(0.0, weight_decay))
+        self.privacy_reference_max_windows = int(max(128, privacy_reference_max_windows))
+        self.privacy_min_distance_quantile = float(np.clip(privacy_min_distance_quantile, 0.01, 0.50))
+        self.privacy_distance_penalty = float(max(0.0, privacy_distance_penalty))
+        self.privacy_noise_strength = float(max(0.0, privacy_noise_strength))
+        self.privacy_baseline_blend = float(np.clip(privacy_baseline_blend, 0.0, 0.75))
+        self.privacy_training_jitter_prob = float(np.clip(privacy_training_jitter_prob, 0.0, 1.0))
+        self.privacy_training_jitter_strength = float(max(0.0, privacy_training_jitter_strength))
+        self.privacy_deduplicate_examples = bool(privacy_deduplicate_examples)
+        self.privacy_filter_enabled = bool(privacy_filter_enabled)
+        self.privacy_filter_max_retries = int(max(0, privacy_filter_max_retries))
 
         self.quantizer = MeanScaleUniformQuantizer(
             num_bins=int(num_bins),
@@ -300,6 +315,9 @@ class LLMSyntheticTimeSeriesGenerator:
         self.is_peft_model: bool = False
         self.backend_name: str = "unknown"
         self.added_special_tokens: int = 0
+        self.privacy_reference_bank: Optional[np.ndarray] = None
+        self.privacy_reference_stats: Dict[str, Any] = {}
+        self._privacy_nbrs: Any = None
 
         self.base_model_id = self.model_name if self._is_hf_model_id(self.model_name) else None
 
@@ -329,6 +347,16 @@ class LLMSyntheticTimeSeriesGenerator:
             "add_calendar_features": self.add_calendar_features,
             "warmup_ratio": self.warmup_ratio,
             "weight_decay": self.weight_decay,
+            "privacy_reference_max_windows": self.privacy_reference_max_windows,
+            "privacy_min_distance_quantile": self.privacy_min_distance_quantile,
+            "privacy_distance_penalty": self.privacy_distance_penalty,
+            "privacy_noise_strength": self.privacy_noise_strength,
+            "privacy_baseline_blend": self.privacy_baseline_blend,
+            "privacy_training_jitter_prob": self.privacy_training_jitter_prob,
+            "privacy_training_jitter_strength": self.privacy_training_jitter_strength,
+            "privacy_deduplicate_examples": self.privacy_deduplicate_examples,
+            "privacy_filter_enabled": self.privacy_filter_enabled,
+            "privacy_filter_max_retries": self.privacy_filter_max_retries,
         }
 
     @staticmethod
@@ -464,6 +492,210 @@ class LLMSyntheticTimeSeriesGenerator:
     def _make_target_text(self, future_token_ids: Sequence[int]) -> str:
         return self.quantizer.tokens_to_text(future_token_ids)
 
+    def _decode_target_window(self, target_text: str, scale: float, horizon: Optional[int] = None) -> np.ndarray:
+        horizon = int(self.prediction_length if horizon is None else horizon)
+        token_ids = self.quantizer.text_to_tokens(target_text)
+        if not token_ids:
+            return np.zeros(horizon, dtype=float)
+        token_ids = token_ids[:horizon]
+        if len(token_ids) < horizon:
+            token_ids = token_ids + [token_ids[-1]] * (horizon - len(token_ids))
+        values = self.quantizer.decode(token_ids, scale)
+        return np.maximum(0.0, np.asarray(values, dtype=float))
+
+    def _encode_target_window_with_scale(self, values: Sequence[float], scale: float) -> str:
+        arr = np.maximum(0.0, np.asarray(values, dtype=float).ravel())
+        scaled = self.quantizer.mean_scale(arr, scale)
+        token_ids = self.quantizer.quantize(scaled)
+        return self.quantizer.tokens_to_text(token_ids)
+
+    def _fit_privacy_index(self) -> None:
+        self._privacy_nbrs = None
+        bank = self.privacy_reference_bank
+        if bank is None:
+            return
+        bank = np.asarray(bank, dtype=np.float32)
+        if bank.ndim != 2 or len(bank) == 0:
+            self.privacy_reference_bank = None
+            return
+
+        self.privacy_reference_bank = bank
+        if len(bank) < 2:
+            self.privacy_reference_stats = {
+                "n_reference_windows": int(len(bank)),
+                "min_distance_threshold": np.nan,
+                "avg_real_nn_distance": np.nan,
+                "distance_quantile": float(self.privacy_min_distance_quantile),
+            }
+            return
+
+        nbrs = NearestNeighbors(n_neighbors=min(2, len(bank)), metric="euclidean")
+        nbrs.fit(bank)
+        dists, _ = nbrs.kneighbors(bank)
+        real_nn = dists[:, 1] if dists.shape[1] > 1 else np.full(len(bank), np.nan, dtype=float)
+        real_nn = real_nn[np.isfinite(real_nn)]
+        threshold = float(np.quantile(real_nn, self.privacy_min_distance_quantile)) if real_nn.size else np.nan
+
+        self._privacy_nbrs = nbrs
+        self.privacy_reference_stats = {
+            "n_reference_windows": int(len(bank)),
+            "min_distance_threshold": threshold,
+            "avg_real_nn_distance": float(np.mean(real_nn)) if real_nn.size else np.nan,
+            "distance_quantile": float(self.privacy_min_distance_quantile),
+        }
+
+    def _prepare_privacy_reference_bank(self, frame: pd.DataFrame) -> Dict[str, Any]:
+        if frame is None or len(frame) == 0 or "target_text" not in frame.columns or "scale" not in frame.columns:
+            self.privacy_reference_bank = None
+            self.privacy_reference_stats = {}
+            self._privacy_nbrs = None
+            return {"privacy_reference_windows": 0}
+
+        ref_df = frame.copy()
+        if self.privacy_deduplicate_examples and {"source_text", "target_text"}.issubset(ref_df.columns):
+            ref_df = ref_df.drop_duplicates(subset=["source_text", "target_text"]).reset_index(drop=True)
+
+        windows: List[np.ndarray] = []
+        for row in ref_df[["target_text", "scale"]].itertuples(index=False):
+            try:
+                win = self._decode_target_window(row.target_text, float(row.scale))
+                if win.size == self.prediction_length and np.all(np.isfinite(win)):
+                    windows.append(np.asarray(win, dtype=np.float32))
+            except Exception:
+                continue
+
+        if not windows:
+            self.privacy_reference_bank = None
+            self.privacy_reference_stats = {}
+            self._privacy_nbrs = None
+            return {"privacy_reference_windows": 0}
+
+        bank = np.asarray(windows, dtype=np.float32)
+        bank = np.unique(np.round(bank, 4), axis=0)
+
+        if len(bank) > self.privacy_reference_max_windows:
+            rng = np.random.default_rng(self.random_state)
+            keep = rng.choice(len(bank), size=self.privacy_reference_max_windows, replace=False)
+            bank = bank[np.sort(keep)]
+
+        self.privacy_reference_bank = bank.astype(np.float32, copy=False)
+        self._fit_privacy_index()
+        out = dict(self.privacy_reference_stats)
+        out["privacy_reference_windows"] = int(len(bank))
+        return out
+
+    def _augment_training_dataframe_for_privacy(self, train_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        if train_df is None or len(train_df) == 0:
+            return train_df, {"n_deduplicated": 0, "n_jittered": 0}
+
+        out = train_df.copy()
+        n_before = len(out)
+        if self.privacy_deduplicate_examples and {"source_text", "target_text"}.issubset(out.columns):
+            out = out.drop_duplicates(subset=["source_text", "target_text"]).reset_index(drop=True)
+        n_deduplicated = int(max(0, n_before - len(out)))
+
+        if (
+            self.privacy_training_jitter_prob <= 0.0
+            or self.privacy_training_jitter_strength <= 0.0
+            or "target_text" not in out.columns
+            or "scale" not in out.columns
+        ):
+            return out, {"n_deduplicated": n_deduplicated, "n_jittered": 0}
+
+        rng = np.random.default_rng(self.random_state)
+        mask = rng.random(len(out)) < float(self.privacy_training_jitter_prob)
+        n_jittered = 0
+        for idx in np.where(mask)[0]:
+            row = out.iloc[int(idx)]
+            try:
+                target = self._decode_target_window(row["target_text"], float(row["scale"]))
+                local_scale = float(np.std(target))
+                if not np.isfinite(local_scale) or local_scale < 1e-8:
+                    local_scale = float(np.mean(target[target > 0])) if np.any(target > 0) else 1.0
+                noise = rng.normal(0.0, self.privacy_training_jitter_strength * max(local_scale, 1.0), size=target.shape)
+                mult = 1.0 + rng.normal(0.0, self.privacy_training_jitter_strength * 0.35, size=target.shape)
+                jittered = np.maximum(0.0, target * mult + noise)
+
+                zero_share = float(np.mean(target == 0))
+                if zero_share > 0.10:
+                    q = float(np.quantile(jittered, min(max(zero_share, 0.0), 0.50)))
+                    jittered = np.where(jittered <= q, 0.0, jittered)
+
+                out.at[out.index[int(idx)], "target_text"] = self._encode_target_window_with_scale(jittered, float(row["scale"]))
+                n_jittered += 1
+            except Exception:
+                continue
+
+        return out.reset_index(drop=True), {"n_deduplicated": n_deduplicated, "n_jittered": int(n_jittered)}
+
+    def _privacy_candidate_distance(self, candidate: Sequence[float]) -> float:
+        cand = np.asarray(candidate, dtype=float).ravel()
+        if self._privacy_nbrs is None or self.privacy_reference_bank is None or cand.size == 0:
+            return np.nan
+        if cand.size != int(self.privacy_reference_bank.shape[1]):
+            return np.nan
+        try:
+            dist, _ = self._privacy_nbrs.kneighbors(cand.reshape(1, -1), n_neighbors=1)
+            return float(dist[0, 0])
+        except Exception:
+            return np.nan
+
+    def _privacy_penalty(self, candidate: Sequence[float]) -> Tuple[float, float]:
+        dist = self._privacy_candidate_distance(candidate)
+        threshold = float(self.privacy_reference_stats.get("min_distance_threshold", np.nan))
+        if (not self.privacy_filter_enabled) or (not np.isfinite(dist)) or (not np.isfinite(threshold)) or threshold <= 1e-8:
+            return 0.0, dist
+        if dist >= threshold:
+            return 0.0, dist
+        penalty = self.privacy_distance_penalty * float((threshold - dist) / (threshold + 1e-8))
+        return penalty, dist
+
+    def _repair_candidate_for_privacy(
+        self,
+        candidate: Sequence[float],
+        baseline: Sequence[float],
+        context_values: Sequence[float],
+        context_dates: Sequence[Any],
+        future_dates: Sequence[Any],
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        cand = np.maximum(0.0, np.asarray(candidate, dtype=float).ravel())
+        best = cand.copy()
+        best_dist = self._privacy_candidate_distance(best)
+        threshold = float(self.privacy_reference_stats.get("min_distance_threshold", np.nan))
+
+        if (not self.privacy_filter_enabled) or (not np.isfinite(best_dist)) or (not np.isfinite(threshold)) or best_dist >= threshold:
+            return best, {"privacy_min_distance": best_dist, "privacy_threshold": threshold, "privacy_repaired": 0.0}
+
+        rng = np.random.default_rng(self.random_state + int(np.sum(best)) + len(best))
+        recent = np.asarray(context_values, dtype=float).ravel()
+        recent = recent[-min(len(recent), 28):] if recent.size else best
+        local_scale = float(np.std(recent))
+        if not np.isfinite(local_scale) or local_scale < 1e-8:
+            local_scale = float(np.mean(recent[recent > 0])) if np.any(recent > 0) else 1.0
+
+        for _ in range(self.privacy_filter_max_retries):
+            noise = rng.normal(0.0, self.privacy_noise_strength * max(local_scale, 1.0), size=best.shape)
+            mult = 1.0 + rng.normal(0.0, self.privacy_noise_strength * 0.35, size=best.shape)
+            trial = np.maximum(0.0, best * mult + noise)
+            trial = (1.0 - self.privacy_baseline_blend) * trial + self.privacy_baseline_blend * np.asarray(baseline, dtype=float).ravel()
+            trial = np.maximum(0.0, trial)
+            trial = self.seasonality_aware_calibration(
+                generated_future=trial,
+                context_values=context_values,
+                context_dates=context_dates,
+                future_dates=future_dates,
+                strength=min(1.0, self.seasonality_strength),
+            )
+            trial_dist = self._privacy_candidate_distance(trial)
+            if not np.isfinite(trial_dist):
+                continue
+            if trial_dist > best_dist:
+                best = trial
+                best_dist = trial_dist
+            if trial_dist >= threshold:
+                break
+
+        return best, {"privacy_min_distance": best_dist, "privacy_threshold": threshold, "privacy_repaired": 1.0}
     def make_examples_from_series(
         self,
         series: Sequence[float],
@@ -611,6 +843,8 @@ class LLMSyntheticTimeSeriesGenerator:
         if self.prefer_backend == "qlora":
             try:
                 import torch
+                if not torch.cuda.is_available():
+                    raise RuntimeError("QLoRA requires CUDA in this setup.")
                 import bitsandbytes  # noqa: F401
                 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
                 from transformers import BitsAndBytesConfig
@@ -638,7 +872,7 @@ class LLMSyntheticTimeSeriesGenerator:
                     lora_alpha=self.lora_alpha,
                     target_modules=target_modules,
                     task_type=TaskType.SEQ_2_SEQ_LM,
-                    lora_dropout=0.05,
+                    lora_dropout=0.10,
                     bias="none",
                 )
                 self.model = get_peft_model(base_model, peft_cfg)
@@ -663,7 +897,7 @@ class LLMSyntheticTimeSeriesGenerator:
                 lora_alpha=self.lora_alpha,
                 target_modules=target_modules,
                 task_type=TaskType.SEQ_2_SEQ_LM,
-                lora_dropout=0.05,
+                lora_dropout=0.10,
                 bias="none",
             )
             self.model = get_peft_model(base_model, peft_cfg)
@@ -695,7 +929,10 @@ class LLMSyntheticTimeSeriesGenerator:
         if self.model is None or self.tokenizer is None:
             self._build_model()
 
-        train_ds = Dataset.from_pandas(train_df[["source_text", "target_text"]].reset_index(drop=True))
+        privacy_ref_info = self._prepare_privacy_reference_bank(train_df)
+        train_df_use, privacy_aug_info = self._augment_training_dataframe_for_privacy(train_df)
+
+        train_ds = Dataset.from_pandas(train_df_use[["source_text", "target_text"]].reset_index(drop=True))
         eval_ds = None
         if eval_df is not None and not eval_df.empty:
             eval_ds = Dataset.from_pandas(eval_df[["source_text", "target_text"]].reset_index(drop=True))
@@ -794,7 +1031,7 @@ class LLMSyntheticTimeSeriesGenerator:
 
         metrics = dict(getattr(train_out, "metrics", {}) or {})
         self.training_info = {
-            "train_examples": int(len(train_df)),
+            "train_examples": int(len(train_df_use)),
             "eval_examples": int(0 if eval_df is None else len(eval_df)),
             "train_steps": int(self.train_steps),
             "learning_rate": float(self.learning_rate),
@@ -803,7 +1040,12 @@ class LLMSyntheticTimeSeriesGenerator:
             "is_peft_model": bool(self.is_peft_model),
             "backend_name": self.backend_name,
             "added_special_tokens": int(self.added_special_tokens),
+            "privacy_reference_windows": int(privacy_ref_info.get("privacy_reference_windows", 0)),
+            "privacy_deduplicated_examples": int(privacy_aug_info.get("n_deduplicated", 0)),
+            "privacy_jittered_examples": int(privacy_aug_info.get("n_jittered", 0)),
         }
+        if self.privacy_reference_stats:
+            self.training_info["privacy_reference_stats"] = dict(self.privacy_reference_stats)
         return self.training_info
 
     def _ensure_model_loaded(self) -> None:
@@ -953,14 +1195,16 @@ class LLMSyntheticTimeSeriesGenerator:
             - _acf(recent, min(self.seasonal_period, max(1, len(recent) - 1)))
         )
 
+        privacy_pen, _ = self._privacy_penalty(cand)
         return float(
-            1.15 * mean_pen
-            + 0.90 * std_pen
-            + 0.55 * zero_pen
-            + 1.10 * seasonal_pen
-            + 0.85 * ref_pen
-            + 0.70 * acf1_pen
-            + 0.90 * acf7_pen
+            1.10 * mean_pen
+            + 0.85 * std_pen
+            + 0.60 * zero_pen
+            + 0.80 * seasonal_pen
+            + 0.75 * ref_pen
+            + 0.60 * acf1_pen
+            + 0.75 * acf7_pen
+            + privacy_pen
         )
 
     def generate(
@@ -968,15 +1212,15 @@ class LLMSyntheticTimeSeriesGenerator:
         context_values: Sequence[float],
         horizon: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        num_return_sequences: int = 10,
+        num_return_sequences: int = 24,
         do_sample: bool = True,
-        temperature: float = 0.9,
-        top_p: float = 0.95,
-        top_k: int = 50,
-        repetition_penalty: float = 1.05,
+        temperature: float = 1.02,
+        top_p: float = 0.92,
+        top_k: int = 64,
+        repetition_penalty: float = 1.08,
         context_dates: Optional[Sequence[Any]] = None,
         future_dates: Optional[Sequence[Any]] = None,
-        apply_seasonal_calibration: bool = True,
+        apply_seasonal_calibration: bool = False,
     ) -> Dict[str, Any]:
         self._ensure_model_loaded()
         horizon = int(self.prediction_length if horizon is None else horizon)
@@ -1034,8 +1278,10 @@ class LLMSyntheticTimeSeriesGenerator:
         raw_candidates = []
         final_candidates = []
         scores = []
+        candidate_min_distances = []
         parsed_token_counts = []
         used_fallback_flags = []
+        privacy_repaired_flags = []
 
         baseline = self.seasonal_naive_baseline(
             context_values=use_context,
@@ -1078,9 +1324,24 @@ class LLMSyntheticTimeSeriesGenerator:
                 context_dates=context_dates,
                 future_dates=future_dates,
             )
+            cal, privacy_meta = self._repair_candidate_for_privacy(
+                candidate=cal,
+                baseline=baseline,
+                context_values=use_context,
+                context_dates=context_dates,
+                future_dates=future_dates,
+            )
+            score = self.candidate_score(
+                candidate=cal,
+                context_values=use_context,
+                context_dates=context_dates,
+                future_dates=future_dates,
+            )
             raw_candidates.append(raw)
             final_candidates.append(cal)
             scores.append(score)
+            candidate_min_distances.append(float(privacy_meta.get("privacy_min_distance", np.nan)))
+            privacy_repaired_flags.append(bool(privacy_meta.get("privacy_repaired", 0.0)))
             used_fallback_flags.append(bool(used_fallback))
 
         best_idx = int(np.argmin(scores))
@@ -1091,11 +1352,14 @@ class LLMSyntheticTimeSeriesGenerator:
             "candidate_scores": [float(s) for s in scores],
             "candidate_futures": [np.asarray(x, dtype=float) for x in final_candidates],
             "raw_candidate_futures": [np.asarray(x, dtype=float) for x in raw_candidates],
+            "candidate_min_distances": [float(x) for x in candidate_min_distances],
             "source_text": source_text,
             "decoded_texts": decoded_texts,
             "parsed_token_counts": parsed_token_counts,
             "used_fallback_flags": used_fallback_flags,
+            "privacy_repaired_flags": privacy_repaired_flags,
             "fallback_share": float(np.mean(used_fallback_flags)) if used_fallback_flags else 0.0,
+            "privacy_repair_share": float(np.mean(privacy_repaired_flags)) if privacy_repaired_flags else 0.0,
             "backend_name": self.backend_name,
         }
 
@@ -1123,6 +1387,10 @@ class LLMSyntheticTimeSeriesGenerator:
 
         (out / "sdg_config.json").write_text(json.dumps(self.config, indent=2), encoding="utf-8")
         (out / "training_info.json").write_text(json.dumps(self.training_info, indent=2), encoding="utf-8")
+        if self.privacy_reference_bank is not None:
+            np.save(out / "privacy_reference_bank.npy", np.asarray(self.privacy_reference_bank, dtype=np.float32))
+        if self.privacy_reference_stats:
+            (out / "privacy_reference_stats.json").write_text(json.dumps(self.privacy_reference_stats, indent=2), encoding="utf-8")
         (out / "README.md").write_text(self._build_model_card(repo_id=repo_id), encoding="utf-8")
 
         if push_to_hub:
@@ -1151,9 +1419,7 @@ class LLMSyntheticTimeSeriesGenerator:
 
         return f"""{yaml_block}
 
-# {repo_name}
-
-Synthetic time-series generation checkpoint for the DIF-PI framework.
+# {repo_name}Synthetic time-series generation checkpoint for the DIF-PI framework.
 
 ## Model summary
 
@@ -1297,6 +1563,16 @@ The model is intended for research on synthetic retail demand generation and val
             add_calendar_features=bool(config.get("add_calendar_features", True)),
             warmup_ratio=float(config.get("warmup_ratio", 0.05)),
             weight_decay=float(config.get("weight_decay", 0.01)),
+            privacy_reference_max_windows=int(config.get("privacy_reference_max_windows", 2000)),
+            privacy_min_distance_quantile=float(config.get("privacy_min_distance_quantile", 0.10)),
+            privacy_distance_penalty=float(config.get("privacy_distance_penalty", 2.0)),
+            privacy_noise_strength=float(config.get("privacy_noise_strength", 0.06)),
+            privacy_baseline_blend=float(config.get("privacy_baseline_blend", 0.15)),
+            privacy_training_jitter_prob=float(config.get("privacy_training_jitter_prob", 0.35)),
+            privacy_training_jitter_strength=float(config.get("privacy_training_jitter_strength", 0.05)),
+            privacy_deduplicate_examples=bool(config.get("privacy_deduplicate_examples", True)),
+            privacy_filter_enabled=bool(config.get("privacy_filter_enabled", True)),
+            privacy_filter_max_retries=int(config.get("privacy_filter_max_retries", 3)),
         )
         obj.config.update(config)
 
@@ -1376,5 +1652,30 @@ The model is intended for research on synthetic retail demand generation and val
             )
             obj.is_peft_model = False
             obj.backend_name = "loaded"
+
+
+        training_info_path = model_path / "training_info.json"
+        if training_info_path.exists():
+            try:
+                obj.training_info = json.loads(training_info_path.read_text(encoding="utf-8"))
+            except Exception:
+                obj.training_info = {}
+
+        privacy_bank_path = model_path / "privacy_reference_bank.npy"
+        if privacy_bank_path.exists():
+            try:
+                obj.privacy_reference_bank = np.load(privacy_bank_path)
+            except Exception:
+                obj.privacy_reference_bank = None
+
+        privacy_stats_path = model_path / "privacy_reference_stats.json"
+        if privacy_stats_path.exists():
+            try:
+                obj.privacy_reference_stats = json.loads(privacy_stats_path.read_text(encoding="utf-8"))
+            except Exception:
+                obj.privacy_reference_stats = {}
+
+        if obj.privacy_reference_bank is not None:
+            obj._fit_privacy_index()
 
         return obj

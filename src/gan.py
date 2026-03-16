@@ -34,7 +34,7 @@ class _Discriminator(nn.Module):
         return self.net(x)
 
 class GANTimeSeriesGenerator:
-    """Lightweight conditional GAN baseline for future demand generation."""
+    """Lightweight conditional GAN baseline."""
     def __init__(self, context_length: int, horizon: int, noise_dim: int = 16, hidden_dim: int = 128,
                  lr: float = 1e-3, batch_size: int = 64, epochs: int = 50, device: str | None = None, seed: int = 42):
         self.context_length = int(context_length)
