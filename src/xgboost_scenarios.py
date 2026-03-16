@@ -2,6 +2,7 @@ import xgboost as xgb
 import numpy as np
 import pandas as pd
 
+
 class XGBoostScenarioGeneration:
     def __init__(self):
         self.model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1)

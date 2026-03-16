@@ -13,7 +13,7 @@ class NPDModel:
     Notes
     -----
     This module is intentionally model-agnostic: any regressor that
-    implements `.fit(X, y)` and `.predict(X)` can be plugged in.
+    implements `.fit(X, y)` and `.predict(X)` can be added.
     """
 
     def __init__(

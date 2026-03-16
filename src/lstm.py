@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+
 class _LSTMForecast(nn.Module):
     def __init__(self, hidden_dim: int, horizon: int, num_layers: int = 1):
         super().__init__()

@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+
 class _TimeGANLike(nn.Module):
     def __init__(self, hidden_dim: int, horizon: int):
         super().__init__()
