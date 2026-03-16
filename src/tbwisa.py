@@ -21,9 +21,9 @@ class TBWISAGenerator:
         self._controlled_elasticity_cfg = None
         self._last_elasticity_meta = {}
 
-    # ----------------------------
-    # Utility helpers (used by DIF-PI)
-    # ----------------------------
+
+    # Utility helpers
+
     @staticmethod
     def revenue(price, demand):
         """Revenue helper used in DIF-PI."""
@@ -42,9 +42,9 @@ class TBWISAGenerator:
                     best = {'start': s, 'end': s+L, 'len': L, 'avg': avg, 'score': score}
         return best
 
-    # ----------------------------
+
     # Elasticity estimation
-    # ----------------------------
+
     def configure_controlled_elasticity(
         self,
         seasonal_periods=(7.0, 365.25),
@@ -198,7 +198,6 @@ class TBWISAGenerator:
             'huber_epsilon': float(huber_epsilon),
             'huber_alpha': float(huber_alpha),
             'seasonal_periods': list(seasonal_periods),
-            # keep these available even though the notebook printout may not use them
             'event_used': bool(event_used),
             'n_fit_event': n_fit_event,
             'price_change_pct_thresh': float(price_change_pct_thresh),
