@@ -214,3 +214,4 @@ __marimo__/
 !/datasets/.gitkeep
 /artifacts/*
 !/artifacts/.gitkeep
+images/
