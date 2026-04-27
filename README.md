@@ -102,6 +102,20 @@ DIF‑PI follows a *predict → simulate → forecast → optimize → screen �
 7. **Executive export**  
    Save the final outputs as CSV/JSON artifacts for analysis, reporting, or dashboards.
 
+### Decision formulation
+
+For a selected SKU $s$ and decision date $t_0$, DIF‑PI returns one decision object that combines the selected intervention, execution window, score, uplift, screening status, and audit trail:
+
+```math
+z_s = (\delta^{*}, \tau^{*}, \ell^{*}, U_s^{*}, \mathrm{uplift}_s, \chi_s, \mathrm{audit}_s)
+```
+
+where $\delta^{*}$ is the recommended price intervention, $\tau^{*}$ is the start offset, $\ell^{*}$ is the execution-window length, and $\chi_s$ is the X‑TBWISA screening status:
+
+```math
+\chi_s(\delta^{*}, \tau^{*}, \ell^{*}) \in \{\mathrm{Accept},\ \mathrm{Accept\_Caution},\ \mathrm{Flag}\}
+```
+
 ### Mapping to repo assets
 
 | DIF‑PI stage | Notebook / Module |
@@ -128,14 +142,14 @@ DIF‑PI follows a *predict → simulate → forecast → optimize → screen �
 - *datasets/processed/difpi_metadata.json*
 
 **Daily aggregation (per SKU)**  
-Let $\mathcal{T}(s,t)$ be the set of transactions for SKU $s$  on day $t$, with quantity $q_i$ and unit price $p_i$:
+Let $\mathcal{T}(s,t)$ be the set of transactions for SKU $s$ on day $t$, with quantity $q_i$ and unit price $p_i$. Daily demand is the total sold quantity:
 
-- **Demand** (units)
 ```math
 Q_{s,t} = \sum_{i\in \mathcal{T}(s,t)} q_i
 ```
 
-- **Price** (quantity-weighted unit price)
+Daily price is computed as a quantity-weighted unit price when the sold quantity is positive, and as the simple average observed price otherwise:
+
 ```math
 P_{s,t} =
 \begin{cases}
@@ -144,106 +158,238 @@ P_{s,t} =
 \end{cases}
 ```
 
-The panel is reindexed to daily continuity, missing demand is set to 0, and missing price is forward-filled to preserve a usable intervention reference.
+The resulting $(P_{s,t}, Q_{s,t})$ series is reindexed to daily continuity over the active span of each SKU. Missing demand values are treated as zero sales and missing prices are filled forward to preserve a valid intervention reference for scenario generation and revenue evaluation.
 
 ### 2) Purchase intention: Next Purchase Day (NPD)
-DIF‑PI uses NPD as a timing signal that complements the pricing decision stage.
-
-For each customer $c$ with purchase dates $(d_1, d_2, \dots, d_n)$, inter-purchase gaps are defined as:
+DIF‑PI uses NPD as a timing signal that complements the pricing decision stage. For each customer $c$, ordered purchase dates are denoted by $\tau_{c,1}, \tau_{c,2}, \dots, \tau_{c,n_c}$. The inter-purchase gaps are:
 
 ```math
-g_i = d_{i+1} - d_i,\quad i=1,\dots,n-1
+g_{c,j} = \tau_{c,j} - \tau_{c,j-1}, \quad j = 2,\dots,n_c
 ```
 
-Given a history length $k$, supervised samples are constructed as:
+For a fixed history length $K$, supervised NPD samples are constructed as:
 
 ```math
-\mathbf{x}_i = [g_{i-k}, \dots, g_{i-1}],\qquad y_i = g_i
+\mathbf{x}_{c,i} = [g_{c,i-K}, g_{c,i-K+1}, \dots, g_{c,i-1}], \qquad y_{c,i} = g_{c,i}
 ```
 
-The predicted next gap $\hat g_c$ is mapped to a next purchase day:
+Inside DIF‑PI, the NPD output is summarized as a horizon-level purchase-intention profile and a reliability weight:
 
 ```math
-\hat d_c = d_{\max} + \mathrm{round}(\hat g_c)
+\mathbf{i}_{t_0+1:t_0+H} = \mathrm{NPD}(\{g_c\}_c), \qquad \alpha = \Gamma(\mathrm{MAE}_{NPD})
 ```
 
-In the framework, NPD error is summarized as MAE in days and converted into a timing-reliability weight. This prevents the executive layer from overusing NPD when timing predictions are weak.
+The reliability gate prevents the executive layer from overusing NPD when timing predictions are weak. In the current implementation, low MAE gives stronger timing influence, acceptable MAE gives mild influence, and high MAE disables the timing contribution.
 
-### 3) What-if scenario generation: TBWISA
-`src/tbwisa.py` implements TBWISA as an SCM-inspired elasticity and residual model with controlled stochasticity.
+### 3) Synthetic data generation (SDG)
+SDG is used when demand histories are sparse, short, intermittent, or need robustness support. The current DIF‑PI implementation keeps the token-based foundation of the published SDG work, while using `amazon/chronos-t5-small` as the encoder-decoder backbone and adding practical safeguards for retail demand generation.
 
-#### Elasticity model
-```math
-\log Q_t = \beta_0 + \varepsilon \log P_t + u_t
-```
-
-where $\varepsilon$ is price elasticity and $u_t$ are residuals.
-
-#### Counterfactual under a price intervention
-For an intervention $\delta$ (%), the counterfactual price is:
+For a context window $y_1, y_2, \dots, y_L$, the module first computes a mean-absolute scale:
 
 ```math
-P_t^{(\delta)} = P_t\left(1+\frac{\delta}{100}\right)
+a = \max\left(\varepsilon,\frac{1}{L}\sum_{i=1}^{L}|y_i|\right)
 ```
 
-and the demand trajectory is reconstructed by applying the elasticity response plus residual structure. The repository also includes log-linear and XGBoost scenario baselines for comparison.
-
-### 4) Demand forecasting
-`train-forecaster.ipynb` trains the global Transformer used to roll out each candidate scenario across the future horizon.
-
-**Multi-step forecasting**
-```math
-\hat y_{t+1}=f_\theta([y_{t-L+1},\dots,y_t]),\quad
-\hat y_{t+h}=f_\theta([\hat y_{t+h-L},\dots,\hat y_{t+h-1}])
-```
-
-In practice, the forecaster receives the scenario-adjusted history and produces the demand path needed for revenue evaluation. Scaling is applied per SKU at inference time to reduce leakage.
-
-### 5) Revenue window optimization
-For each price intervention $\delta$, DIF‑PI computes revenue over the forecast horizon:
+The demand values are then scaled as:
 
 ```math
-R_t^{(\delta)} = P_t^{(\delta)} \cdot \hat Q_t^{(\delta)}
+\tilde{y}_i = \frac{y_i}{a}
 ```
 
-For a start offset $s$ and window length $\ell$, the average revenue inside the candidate window is:
+The scaled values are quantized into a fixed vocabulary of time-series tokens. In the default configuration, the implementation uses 4094 bins and clips the scaled value range to $[-5,5]$. The source sequence follows the thesis prompt structure:
 
 ```math
-\bar R_{s,\ell}^{(\delta)} = \frac{1}{\ell}\sum_{t=s}^{s+\ell-1} R_t^{(\delta)}
+\text{task prefix}\ |\ \text{horizon}=H\ |\ \text{metadata}\ |\ \text{context: token sequence}
 ```
 
-A simple score used in the repository is:
+The default context length is 140 observations and the default prediction length is 30 observations. The SDG module supports symbolic time-series tokens, optional calendar and sequence-state metadata tokens, low-rank adaptation with QLoRA-style loading when available, fallback to LoRA or plain sequence-to-sequence loading, privacy-aware candidate filtering, training-time jitter, seasonality-aware calibration, sparse-series handling, and a moving-block bootstrap fallback for conservative robustness checks.
+
+Synthetic data are treated as augmentation and repair support. They do not replace real held-out targets in validation.
+
+### 4) What-if scenario generation: TBWISA
+`src/tbwisa.py` implements TBWISA as an SCM-inspired scenario generator with controlled structural elasticity estimation, counterfactual price interventions, non-linear elasticity adjustment, residual reconstruction, and controlled stochasticity.
+
+The controlled elasticity estimator first keeps only rows where log-space fitting is valid and where lagged demand can be used safely:
 
 ```math
-\text{score}(s,\ell)=\bar R_{s,\ell}^{(\delta)} - \lambda \ell
+M = \{t \in \{2,\dots,T\}: p_t > 0,\ d_t > 0,\ d_{t-1} > 0\}
 ```
 
-where $\lambda$ is an optional length penalty. The selected window is:
+When event-based fitting is enabled, the estimator can focus on rows where the price movement is large enough:
 
 ```math
-(s^{*},\ell^{*})=\arg\max_{s,\ell}\ \text{score}(s,\ell)
+E_{\tau} = \{t \in M: |\log p_t - \log p_{t-1}| \geq \log(1+\tau)\}
 ```
 
-The optimizer searches over valid windows and keeps the configuration that maximizes the selected score while respecting the practical demand and stability checks implemented in the notebook pipeline.
-
-### 6) Explainability screening: X‑TBWISA
-Before export, DIF‑PI applies a screening layer to distinguish stable decisions from risky ones.
-
-A surrogate can be fit to approximate the teacher forecaster over intervention outputs, and the approximation quality can be summarized by:
+If enough event rows exist, $E_{\tau}$ is used; otherwise the estimator falls back to $M$. On the retained rows, TBWISA fits a robust Huber regression in log space:
 
 ```math
-\mathrm{MAE}=\frac{1}{N}\sum_{i=1}^{N}\left|\hat y_i^{(\text{teacher})}-\hat y_i^{(\text{surrogate})}\right|,
-\quad
-\mathrm{RMSE}=\sqrt{\frac{1}{N}\sum_{i=1}^{N}\left(\hat y_i^{(\text{teacher})}-\hat y_i^{(\text{surrogate})}\right)^2}
+\log d_t =
+a + \beta \log p_t + \gamma \log d_{t-1} + \eta z_t
++ \sum_{j=1}^{J}\left[
+u_j \sin\left(\frac{2\pi t}{s_j}\right)
++ v_j \cos\left(\frac{2\pi t}{s_j}\right)
+\right]
++ \varepsilon_t
 ```
 
-This is combined with SHAP-based diagnostics and economic plausibility checks to assign one of three labels:
+where $a$ is the intercept, $\beta$ is the own-price elasticity coefficient, $\log d_{t-1}$ is the lagged demand control, $z_t$ is the z-scored trend term, and the Fourier terms capture seasonality. The implementation uses weekly and annual seasonal periods, Huber regression, a conservative negative prior when the raw coefficient is non-negative, and optional clipping of extreme elasticity magnitudes.
+
+For an intervention $\delta$ (%), the adjusted price path is:
+
+```math
+p_t^{(\delta)} = p_t\left(1+\frac{\delta}{100}\right)
+```
+
+The implemented non-linear elasticity adjustment is:
+
+```math
+\beta^{(\delta)} = \beta(1+0.5\Delta^2), \qquad \Delta = \frac{\delta}{100}
+```
+
+The counterfactual demand anchor is reconstructed in log space as:
+
+```math
+\tilde{d}_t^{(\delta)} =
+\exp\left(a + \beta^{(\delta)}\log p_t^{(\delta)} + e_t\right)
+```
+
+where $e_t$ is the residual series retained from the elasticity stage. A controlled stochastic perturbation is then added:
+
+```math
+\xi_t^{(\delta)} \sim \mathcal{N}(0,\sigma^2\Delta^2), \qquad
+\xi_t^{(\delta)} \in [-c,c]
+```
+
+and the final scenario demand is:
+
+```math
+d_t^{(\delta)} = \tilde{d}_t^{(\delta)}(1+\xi_t^{(\delta)})
+```
+
+The repository also includes log-linear and XGBoost scenario baselines for comparison. These baselines are useful references, but they do not use the full controlled elasticity logic, lagged-demand control, Fourier seasonality controls, sign-constrained elasticity, or stochastic counterfactual perturbation used by TBWISA.
+
+### 5) Global demand forecasting
+`train-forecaster.ipynb` trains the global Transformer used to roll out each candidate scenario across the future horizon. The forecaster is a global univariate encoder-only Transformer trained on pooled SKU demand windows.
+
+Let $y_{s,t}$ denote the observed daily demand for SKU $s$ at time $t$. For sequence length $L$, the supervised training pair is:
+
+```math
+\mathbf{x}_{s,t} = [y_{s,t-L}, y_{s,t-L+1}, \dots, y_{s,t-1}], \qquad y_{s,t}
+```
+
+The model learns:
+
+```math
+\hat{y}_{s,t} = f_{\theta}(\mathbf{x}_{s,t})
+```
+
+Each SKU is scaled before pooling its windows into the global training set:
+
+```math
+\tilde{y}_{t}^{(s)} =
+\frac{y_t^{(s)} - \min(y^{(s)})}
+{\max(y^{(s)}) - \min(y^{(s)})}
+```
+
+At inference time, the saved model is reused for each scenario history without retraining. The one-step forecast from a scenario history $h_{1:T}^{(\delta)}$ is:
+
+```math
+\hat{y}_{T+1}^{(\delta)}
+= f_{\theta}(h_{T-L+1}^{(\delta)}, \dots, h_T^{(\delta)})
+```
+
+The multi-step rollout is recursive:
+
+```math
+\hat{y}_{T+h}^{(\delta)}
+= f_{\theta}(\hat{y}_{T+h-L}^{(\delta)}, \dots, \hat{y}_{T+h-1}^{(\delta)}),
+\qquad h = 1,\dots,H
+```
+
+Scaling is fitted only on the available scenario history during inference, which keeps the rollout leakage-safe.
+
+### 6) Revenue window optimization
+For each intervention $\delta$, DIF‑PI computes expected daily revenue over the forecast horizon:
+
+```math
+R_t^{(\delta)} = P_t^{(\delta)} \cdot \hat{Q}_t^{(\delta)}
+```
+
+For a start offset $s$ and window length $\ell$, the average revenue inside the candidate execution window is:
+
+```math
+\bar{R}_{s,\ell}^{(\delta)}
+= \frac{1}{\ell}\sum_{t=s}^{s+\ell-1} R_t^{(\delta)}
+```
+
+The implementation-level window score is:
+
+```math
+\mathrm{score}(s,\ell) = \bar{R}_{s,\ell}^{(\delta)} - \lambda \ell
+```
+
+where $\lambda \geq 0$ controls the length penalty. The selected window is:
+
+```math
+(s^{*},\ell^{*}) =
+\arg\max_{s,\ell}\ \mathrm{score}(s,\ell)
+```
+
+The thesis also defines the more general decision objective with feasibility and instability penalties:
+
+```math
+S(\delta,a,b)
+= \sum_{\tau=a}^{b} P_{\tau}^{(\delta)} \cdot \hat{Q}_{\tau}^{(\delta)}
+- \lambda \cdot \mathrm{Penalty}(b-a+1)
+- \gamma \cdot \mathrm{Volatility}(\hat{Q}_{a:b}^{(\delta)})
+```
+
+The optimizer searches valid windows, ranks candidate decisions, and then passes the top alternatives to X‑TBWISA screening and executive guardrails.
+
+### 7) Explainability screening: X‑TBWISA
+Before export, DIF‑PI applies X‑TBWISA to distinguish stable decisions from risky ones. The teacher is the global forecaster used in the TBWISA workflow. X‑TBWISA builds a surrogate dataset from intervention-level features and teacher outputs:
+
+```math
+\mathcal{S} =
+\{(\mathbf{x}_{\delta,t}, \hat{y}_{\delta,t}^{teacher})\}_{\delta\in\Delta,\ t=1,\dots,H}
+```
+
+An XGBoost surrogate is fitted on this dataset. If $y_i$ is the teacher output and $\hat{y}_i$ is the surrogate prediction, surrogate fidelity is reported as:
+
+```math
+\mathrm{MAE} =
+\frac{1}{n}\sum_{i=1}^{n}|y_i-\hat{y}_i|,
+\qquad
+\mathrm{RMSE} =
+\sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2}
+```
+
+X‑TBWISA then computes SHAP-based diagnostics. Adjacent-delta explanation drift is measured as a normalized $L_1$ distance:
+
+```math
+d_{SHAP}(\delta,\delta+\Delta)
+=
+\frac{\|\phi_{\delta}-\phi_{\delta+\Delta}\|_1}
+{\|\phi_{\delta}\|_1+\varepsilon}
+```
+
+The price-drift ratio checks whether drift is concentrated in intervention-related features:
+
+```math
+r_{price}(\delta)
+=
+\frac{|\phi_{\delta,\mathrm{delta\_pct}}| + |\phi_{\delta,\mathrm{last\_price}}|}
+{\sum_j |\phi_{\delta,j}|+\varepsilon}
+```
+
+These diagnostics are combined with local monotonicity, price-alignment, economic plausibility, and surrogate-fidelity checks. The final screening labels are:
+
 - *Accept*
 - *Accept_Caution*
 - *Flag*
 
-### 7) Synthetic data generation (SDG)
-SDG is used when demand histories are sparse or intermittent. The repository includes the proposed LLM-based SDG module together with benchmark generators. In practice, SDG supports robustness experiments such as real-only versus real+synthetic training, and the effect is assessed through fidelity, utility, privacy, and downstream decision stability.
+The explanation layer is diagnostic rather than causal: SHAP values are used for auditing and screening the scenario behavior, while the intervention semantics remain defined by the TBWISA structural scenario engine.
 
 
 ## Key defaults
