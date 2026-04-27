@@ -21,6 +21,14 @@ Recommended path for the executive DIF‑PI demo: EDA → training → `dif-pi.i
 3. Run `train-npd.ipynb` to save the NPD artifact bundle in *artifacts/models/npd_transformer_bundle/*.
 4. Run `dif-pi.ipynb` to generate the end-to-end decision outputs in *artifacts/difpi_exec_demo/*.
 
+Optional validation path for thesis reporting:
+
+5. Run `npd-validation.ipynb` for purchase-intention validation.
+6. Run `sdg-validation.ipynb` for synthetic-demand validation.
+7. Run `tbwisa-validation.ipynb` for standalone scenario-generation validation.
+8. Run `x-tbwisa-validation.ipynb` for explainability and screening validation.
+9. Run `dif-pi-ablation.ipynb` for module-level and mechanism-level ablation analysis.
+
 
 ## Repository structure
 
@@ -30,6 +38,8 @@ DIF-PI/
 │   ├── difpi_exec_demo/                         # exported DIF-PI decisions
 │   ├── npd_validation/                          # NPD validation exports
 │   ├── sdg_validation/                          # SDG validation exports
+│   ├── tbwisa_validation_outputs/               # TBWISA validation exports
+│   ├── x_tbwisa_validation_outputs/             # X-TBWISA validation exports
 │   └── models/
 │       ├── npd_transformer_bundle/              # global + clustered NPD models
 │       ├── scenario_gen_transformer_global/     # global forecaster checkpoint
@@ -53,9 +63,12 @@ DIF-PI/
 │   ├── transformer_forecaster.py
 │   └── xgboost_scenarios.py
 ├── dif-pi.ipynb
+├── dif-pi-ablation.ipynb
 ├── eda-complete-journey.ipynb
 ├── npd-validation.ipynb
 ├── sdg-validation.ipynb
+├── tbwisa-validation.ipynb
+├── x-tbwisa-validation.ipynb
 ├── train-forecaster.ipynb
 ├── train-npd.ipynb
 ├── train-sdg.ipynb
@@ -97,9 +110,10 @@ DIF‑PI follows a *predict → simulate → forecast → optimize → screen �
 | Purchase intention (NPD) | `src/npd.py`, `train-npd.ipynb`, `npd-validation.ipynb` |
 | SDG model training and validation | `src/sdg.py`, `src/sdg_integration.py`, `train-sdg.ipynb`, `sdg-validation.ipynb` |
 | Global forecasting training | `src/transformer_forecaster.py`, `train-forecaster.ipynb` |
-| What-if scenario generation | `src/tbwisa.py`, `src/loglinear_scenarios.py`, `src/xgboost_scenarios.py` |
+| What-if scenario generation | `src/tbwisa.py`, `src/loglinear_scenarios.py`, `src/xgboost_scenarios.py`, `tbwisa-validation.ipynb` |
 | End-to-end executive decision run | `dif-pi.ipynb` |
-| Explainability screening | `dif-pi.ipynb` |
+| Explainability screening | `dif-pi.ipynb`, `x-tbwisa-validation.ipynb` |
+| Module and mechanism ablation | `dif-pi-ablation.ipynb` |
 
 
 ## Core components
@@ -147,7 +161,7 @@ Given a history length $k$, supervised samples are constructed as:
 \mathbf{x}_i = [g_{i-k}, \dots, g_{i-1}],\qquad y_i = g_i
 ```
 
-The predicted next gap $hat g_c$ is mapped to a next purchase day:
+The predicted next gap $\hat g_c$ is mapped to a next purchase day:
 
 ```math
 \hat d_c = d_{\max} + \mathrm{round}(\hat g_c)
@@ -163,7 +177,7 @@ In the framework, NPD error is summarized as MAE in days and converted into a ti
 \log Q_t = \beta_0 + \varepsilon \log P_t + u_t
 ```
 
-where $\varepsilon# is price elasticity and $u_t$ are residuals.
+where $\varepsilon$ is price elasticity and $u_t$ are residuals.
 
 #### Counterfactual under a price intervention
 For an intervention $\delta$ (%), the counterfactual price is:
@@ -253,6 +267,9 @@ SDG is used when demand histories are sparse or intermittent. The repository inc
 | `npd-validation.ipynb` | Validate the NPD module and export benchmark tables/plots | *artifacts/npd_validation/* |
 | `train-sdg.ipynb` | Train the LLM-based SDG module | *artifacts/models/sdg_chronos_t5_small_dunnhumby/* |
 | `sdg-validation.ipynb` | Validate the SDG module and compare against benchmark generators | *artifacts/sdg_validation/* |
+| `tbwisa-validation.ipynb` | Validate TBWISA against log-linear and XGBoost scenario generators | *artifacts/tbwisa_validation_outputs/* |
+| `x-tbwisa-validation.ipynb` | Validate X‑TBWISA surrogate fidelity, SHAP diagnostics, drift, and screening labels | *artifacts/x_tbwisa_validation_outputs/* |
+| `dif-pi-ablation.ipynb` | Run module-level and mechanism-level ablations for the integrated DIF‑PI workflow | *artifacts/difpi_exec_demo/* |
 
 
 ## Core source modules
@@ -302,6 +319,28 @@ The SDG validation workflow adds a separate reproducible benchmark path:
 - `train-sdg.ipynb` trains and saves the proposed SDG checkpoint;
 - `sdg-validation.ipynb` evaluates the proposed SDG on held-out SKU futures and case-SKU reconstruction;
 - the validation stage reports *fidelity*, *utility*, and *privacy* diagnostics and compares the proposed generator against benchmark sequence generators.
+
+### TBWISA validation
+The TBWISA validation workflow separates the scenario-generation evidence from the integrated executive run:
+- `tbwisa-validation.ipynb` loads the processed SKU panel and the saved global Transformer forecaster;
+- the notebook evaluates TBWISA against log-linear and XGBoost scenario generators;
+- the validation stage reports baseline forecast accuracy, implied elasticity behavior, monotonicity consistency, economic plausibility, elasticity-noise sensitivity, and optimal-window stability;
+- the outputs are saved under *artifacts/tbwisa_validation_outputs/*.
+
+### X‑TBWISA validation
+The X‑TBWISA validation workflow evaluates the explainability and screening layer as a standalone component:
+- `x-tbwisa-validation.ipynb` builds a surrogate dataset from TBWISA intervention scenarios and teacher-forecaster outputs;
+- an XGBoost surrogate is used for TreeSHAP analysis and surrogate-fidelity reporting;
+- the validation stage measures adjacent-delta SHAP drift, price-feature drift, monotonicity, and price-alignment;
+- each scenario receives an *Accept*, *Accept_Caution*, or *Flag* status under the screening policy;
+- the outputs are saved under *artifacts/x_tbwisa_validation_outputs/*.
+
+### DIF‑PI ablation analysis
+The ablation notebook evaluates which modules and mechanisms affect the final executive recommendation:
+- `dif-pi-ablation.ipynb` runs the full reference workflow and compares it with ablated variants;
+- tested variants include `sdg_off`, `clustering_off`, `npd_timing_weight_off`, `controlled_elasticity_to_simple_loglog`, `nonlinear_elasticity_off`, `stochastic_simulation_off`, `x_tbwisa_screening_off`, and `forecaster_replacement_arima`;
+- the analysis summarizes decision-score changes, uplift changes, screening-status shifts, recommended-delta shifts, and execution-window shifts;
+- the outputs are saved under *artifacts/difpi_exec_demo/*.
 
 ### Experiment gallery
 
@@ -423,6 +462,15 @@ Running `dif-pi.ipynb` writes the main decision artifacts under *artifacts/difpi
 ### SDG validation outputs
 `sdg-validation.ipynb` exports evaluation tables under *artifacts/sdg_validation/*, including fidelity summaries, utility scores, privacy diagnostics, and benchmark comparison files.
 
+### TBWISA validation outputs
+`tbwisa-validation.ipynb` exports scenario-generation validation files under *artifacts/tbwisa_validation_outputs/*, including diagnostic CSV files and validation figures for accuracy, plausibility, elasticity, noise sensitivity, and window stability.
+
+### X‑TBWISA validation outputs
+`x-tbwisa-validation.ipynb` exports explainability and screening validation files under *artifacts/x_tbwisa_validation_outputs/*, including validation figures for surrogate fidelity, global SHAP, local waterfall, adjacent-delta drift, and screening outcomes.
+
+### DIF‑PI ablation outputs
+`dif-pi-ablation.ipynb` exports ablation results under *artifacts/difpi_exec_demo/*, including ablation figures for score change, uplift change, screening-status distribution, recommended-delta shift, and window shift.
+
 
 ## What is required before running the validation notebooks
 
@@ -432,9 +480,10 @@ To run the full workflow you still need:
 
 - the raw dunnhumby-Complete Journey export under `datasets/raw/complete_journey/`;
 - the processed DIF‑PI files generated by `eda-complete-journey.ipynb`;
-- the saved global forecaster checkpoint from `train-forecaster.ipynb`;
+- the saved global forecaster checkpoint from `train-forecaster.ipynb` for `dif-pi.ipynb`, `tbwisa-validation.ipynb`, `x-tbwisa-validation.ipynb`, and `dif-pi-ablation.ipynb`;
 - the saved NPD artifact bundle from `train-npd.ipynb` for `npd-validation.ipynb` and the NPD-enabled DIF‑PI run;
-- the saved SDG checkpoint from `train-sdg.ipynb` for `sdg-validation.ipynb` and optional SDG-enabled experiments.
+- the saved SDG checkpoint from `train-sdg.ipynb` for `sdg-validation.ipynb` and optional SDG-enabled experiments;
+- the saved train/test SKU split when available, so TBWISA, X‑TBWISA, integrated DIF‑PI, and ablation experiments use the same holdout protocol.
 
 
 ## Setup
