@@ -202,7 +202,7 @@ The scaled values are quantized into a fixed vocabulary of time-series tokens. I
 \text{task prefix}\ |\ \text{horizon}=H\ |\ \text{metadata}\ |\ \text{context: token sequence}
 ```
 
-The default context length is 140 observations and the default prediction length is 30 observations. The SDG module supports symbolic time-series tokens, optional calendar and sequence-state metadata tokens, low-rank adaptation with QLoRA-style loading when available, fallback to LoRA or plain sequence-to-sequence loading, privacy-aware candidate filtering, training-time jitter, seasonality-aware calibration, sparse-series handling, and a moving-block bootstrap fallback for conservative robustness checks.
+The default context length is 140 observations and the default prediction length is 30 observations. The SDG module supports symbolic time-series tokens, optional calendar and sequence-state metadata tokens, low-rank adaptation with QLoRA loading when available, fallback to LoRA or plain sequence-to-sequence loading, privacy-aware candidate filtering, training-time jitter, seasonality-aware calibration, sparse-series handling, and a moving-block bootstrap fallback for conservative robustness checks.
 
 Synthetic data are treated as augmentation and repair support. They do not replace real held-out targets in validation.
 
@@ -638,16 +638,19 @@ To run the full workflow you still need:
 Python **3.10+** is recommended.
 
 ### Suggested dependencies
-Base notebooks use: *numpy, pandas, scipy, scikit-learn, xgboost, statsmodels, tensorflow, matplotlib, shap, joblib
+Base notebooks use: *numpy, pandas, scipy, scikit-learn, xgboost, statsmodels, tensorflow, matplotlib, shap*
 
-Additional dependencies used by the NPD and SDG training and validation notebooks: torch, transformers, datasets, sentencepiece, peft, accelerate, autots, bitsandbytes
+Additional dependencies used by the NPD and SDG training and validation notebooks: *torch, transformers, datasets, sentencepiece, peft, accelerate, autots, huggingface-hub*
+
+Optional acceleration packages such as `bitsandbytes` can be installed separately when using quantized QLoRA loading on compatible hardware, but they are not required for the default repository workflow.
 
 Install:
 
 ```bash
 python -m venv .venv
-python -m pip install --upgrade pip
 source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 
