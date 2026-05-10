@@ -235,7 +235,7 @@ u_j \sin\left(\frac{2\pi t}{s_j}\right)
 
 where $a$ is the intercept, $\beta$ is the own-price elasticity coefficient, $\log d_{t-1}$ is the lagged demand control, $z_t$ is the z-scored trend term, and the Fourier terms capture seasonality. The implementation uses weekly and annual seasonal periods, Huber regression, a conservative negative prior when the raw coefficient is non-negative, and optional clipping of extreme elasticity magnitudes.
 
-For an intervention $\delta$ (%), the adjusted price path is:
+For an intervention $\delta$ (%) and $p_δ=\frac{\delta}{100}$, the adjusted price path is:
 
 ```math
 p_t^{(\delta)} = p_t\left(1+\frac{\delta}{100}\right)
@@ -244,7 +244,7 @@ p_t^{(\delta)} = p_t\left(1+\frac{\delta}{100}\right)
 The implemented non-linear elasticity adjustment is:
 
 ```math
-\beta^{(\delta)} = \beta(1+0.5\Delta^2), \qquad \Delta = \frac{\delta}{100}
+\beta^{(\delta)} = \beta(1+0.5p_\delta^2)
 ```
 
 The counterfactual demand anchor is reconstructed in log space as:
@@ -316,24 +316,24 @@ For each intervention $\delta$, DIF‑PI computes expected daily revenue over th
 R_t^{(\delta)} = P_t^{(\delta)} \cdot \hat{Q}_t^{(\delta)}
 ```
 
-For a start offset $s$ and window length $\ell$, the average revenue inside the candidate execution window is:
+For a start offset $\tau$ and window length $\ell$, the average revenue inside the candidate execution window is:
 
 ```math
-\bar{R}_{s,\ell}^{(\delta)}
-= \frac{1}{\ell}\sum_{t=s}^{s+\ell-1} R_t^{(\delta)}
+\bar{R}_{\tau,\ell}^{(\delta)}
+= \frac{1}{\ell}\sum_{h=\tau}^{\tau+\ell-1} R_{t_0+h}^{(\delta)}
 ```
 
 The implementation-level window score is:
 
 ```math
-\mathrm{score}(s,\ell) = \bar{R}_{s,\ell}^{(\delta)} - \lambda \ell
+\mathrm{score}(\tau,\ell) = \bar{R}_{\tau,\ell}^{(\delta)} - \lambda \ell
 ```
 
 where $\lambda \geq 0$ controls the length penalty. The selected window is:
 
 ```math
-(s^{*},\ell^{*}) =
-\arg\max_{s,\ell}\ \mathrm{score}(s,\ell)
+(\tau^{*},\ell^{*}) =
+\arg\max_{\tau,\ell}\ \mathrm{score}(\tau,\ell)
 ```
 
 The thesis also defines the more general decision objective with feasibility and instability penalties:
