@@ -395,7 +395,7 @@ The explanation layer is diagnostic rather than causal: SHAP values are used for
 ## Key defaults
 
 - *Eligibility mode:* adaptive, strict, relaxed
-- *Delta grid (δ):* [-15, -10, -5, 0, 5, 10, 15]
+- *Delta grid (δ):* [-15, -12, -10, -7, -5, -2, 0, 2, 5, 7, 10, 12, 15]
 - *Forecast horizon:* 30 days
 - *Global model location:* artifacts/models/scenario_gen_transformer_global/
 - *NPD model location:* artifacts/models/npd_transformer_bundle/
@@ -512,11 +512,11 @@ The purpose is not perfect matching, but distributional plausibility (spikes, vo
 
 **How to interpret and use**
 - If the synthetic series matches key stylized facts (volatility, spikes, rough seasonality), it is suitable for robustness testing.
-- Use SDG to compare real-only vs real + synthetic forecaster training, then report both forecast error changes and decision stability (recommended $\delta$ consistency).
+- Use SDG to compare real-only vs real+synthetic forecaster training, then report both forecast error changes and decision stability (recommended $\delta$ consistency).
 
 
 #### E3 — Price/demand visualization for a representative SKU (SKU 1070820)
-This is a lightweight , paper‑grade check that the SKU panel is aligned and economically plausible.
+This is a lightweight check that the SKU panel is aligned and economically plausible.
 
 ![Price time series](assets/price.png)
 ![Demand time series](assets/demand.png)
@@ -548,7 +548,7 @@ This figure summarizes the final decision logic: window score vs delta.
 ![Executive decision view (TBWISA): Score vs delta with X‑TBWISA screening](assets/executive_decision.png)
 
 **Interpretation**
-- Screening can override the raw optimum when the response is unstable or implausible.
+- Screening can downgrade the raw optimum when the response is unstable or implausible.
 - The final executive recommendation is exported in `executive_summary_case_sku_<SKU>.json`.
 
 
